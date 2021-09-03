@@ -2,14 +2,13 @@ module Main where
 
 import Prelude
 
-import Control.Monad.RWS (RWS, RWSResult(..), runRWS, tell)
+import Control.Monad.RWS (RWS, RWSResult(..), runRWS)
 import Control.Monad.State.Trans (get, modify_)
 import Data.Either (Either(..))
 import Data.Generic.Rep (class Generic)
 import Data.List (List(..), (:))
 import Data.Maybe (Maybe(..))
 import Data.Show.Generic (genericShow)
-import Data.Traversable (for_)
 import Effect (Effect)
 import Effect.Console (log)
 import Node.Process (exit)
@@ -18,13 +17,10 @@ import Random.LCG (Seed, lcgNext, randomSeed, unSeed)
 
 -- Data Types
 
-type Log
-  = Array String
+type Log = Unit
 
 type Env
-  -- exit is the effect of exiting
-  = { exit :: Effect Unit
-    }
+  = {}
 
 type GameState
   = { seed :: Seed
@@ -76,14 +72,14 @@ data Command
 parseCommand :: String -> Either String Command
 parseCommand = case _ of
   "attack" -> Right Attack
-  "run" -> Right Run
   "next" -> Right Run
   "leave" -> Right Leave
   _ -> Left "unknown command"
 
-data Result
+data GameResult
   = NoopResult
-  | WinResult
+  | AttackingAirResult
+  | BattleEnsuedResult BattleResult
   | ExitResult
 
 -- Game values
@@ -147,64 +143,67 @@ generateWorld = do
       modify_ (updateRooms r)
       go (n - 1)
 
-battle :: Player -> Monster -> Game Unit
+type BattleResult
+  = { playerHit :: Boolean, monsterHit :: Boolean }
+
+battle :: Player -> Monster -> Game BattleResult
 battle (Player player) (Monster monster) = do
-  -- player attack
   playerAtk <- (_ + player.atk) <$> rollD20
   playerDodge <- (_ + player.dex) <$> rollD20
   monsterAtk <- (_ + monster.atk) <$> rollD20
   monsterDodge <- (_ + monster.dex) <$> rollD20
 
-  if playerAtk > monsterDodge
-    then do
-      tell ["you hit for " <> show playerAtk <> " damage"]
-      let monster' = monster { hp = max 0 $ monster.hp - playerAtk }
-      modify_ $ updateRoomMonster monster'
-    else do
-      tell ["you missed"]
+  let playerHit = playerAtk > monsterDodge
+  let monsterHP = if playerHit
+    then max 0 $ monster.hp - playerAtk
+    else monster.hp
 
-  if monsterAtk > playerDodge
-    then do
-      tell ["they hit you for " <> show monsterAtk <> " damage"]
-      let player' = player { hp = max 0 $ player.hp - monsterAtk }
-      modify_ $ updatePlayer player'
-    else do
-      tell ["they missed"]
+  let playerGold = if monsterHP == 0
+    then player.gold + monster.gold
+    else player.gold
+
+  let monsterHit = monsterHP > 0 && monsterAtk > playerDodge
+  let playerHP = if monsterHit
+    then max 0 $ player.hp - monsterAtk
+    else player.hp
+
+  let monster' = if monsterHP == 0
+    then Nothing
+    else Just <<< Monster $ monster { hp = monsterHP }
+
+  let player' = Player $ player { hp = playerHP, gold = playerGold }
+
+  modify_ $ _ { player = player' }
+  modify_ $ updateRoomMonster monster'
+  pure { playerHit, monsterHit }
 
   where
-    updatePlayer :: Stats -> GameState -> GameState
-    updatePlayer stats s = s { player = Player stats }
-
-    updateRoomMonster :: Stats -> GameState -> GameState
-    updateRoomMonster monster' s = let
-      rooms = case s.rooms of
-        Nil -> Nil
-        (room:rest) -> let
-          room' = room { monster = Just $ Monster monster' }
-          in
-           room' : rest
+    updateRoomMonster :: Maybe Monster -> GameState -> GameState
+    updateRoomMonster m s = 
+      let
+        rooms = mapHead (_ { monster = m }) s.rooms
       in
-       s { rooms = rooms }
+        s { rooms = rooms }
 
+mapHead :: forall a. (a -> a) -> List a -> List a
+mapHead _ Nil = Nil
+mapHead f (x:xs) = f x : xs
 
-interpret :: Command -> Game Result
-interpret cmd = case cmd of
-  Attack -> do
-    state <- get
-    case state.rooms of
-      Nil ->
-        pure WinResult
-      (room:_) -> case room.monster of
+interpret :: Room -> Command -> Game GameResult
+interpret room cmd = case cmd of
+    Leave ->
+      pure ExitResult
+    Attack -> do
+      case room.monster of
         Nothing -> do
-          tell $ ["There is no monster here"]
-          pure NoopResult
+          pure AttackingAirResult
         Just monster -> do
-          battle state.player monster
-          pure NoopResult
-  Run -> do
-    pure NoopResult
-  Leave -> do
-    pure ExitResult
+          state <- get
+          result <- battle state.player monster
+          pure $ BattleEnsuedResult result
+    Run -> do
+      -- TODO
+      pure NoopResult
 
 
 
@@ -231,6 +230,7 @@ gamePrompt state =
   "HP: " <> show stats.hp <> " / Gold: " <> show stats.gold <> " λ. "
   where
     stats = case state.player of (Player s) -> s
+
 initializeState :: Env -> Effect GameState
 initializeState env = do
   seed <- randomSeed
@@ -239,33 +239,39 @@ initializeState env = do
   pure $ state
 
 loop :: Interface -> Env -> GameState -> Effect Unit
-loop interface env currentState = do
-  displayCurrentState currentState
-  question (gamePrompt currentState) handler interface
+loop _ _ { rooms: Nil } = do
+  log "You win!"
+  exit 0
+loop interface env currentState@{ rooms: (room:_) } = do
+    displayCurrentState currentState
+    question (gamePrompt currentState) handler interface
   where
     handler s = do
       case parseCommand s of
         Left err -> do
           log err
-          log ""
           loop interface env currentState
         Right cmd -> do
-          let RWSResult state result msgs = runRWS (interpret cmd) env currentState
-          for_ msgs log
-          case result of
-            NoopResult -> do
-              loop interface env state
-              pure unit
-            ExitResult -> do
-              env.exit
-            WinResult -> do
-              log "You Won!"
-              env.exit
+          let RWSResult state result _ = runRWS (interpret room cmd) env currentState
 
+          renderResult result state
+          loop interface env state
+
+renderResult :: GameResult -> GameState -> Effect Unit
+renderResult AttackingAirResult _ = do
+  log "You swing wildly at the air"
+renderResult (BattleEnsuedResult { playerHit, monsterHit }) _ = do
+  when playerHit $ log $ "Player hit!"
+  when monsterHit $ log $ "Monster hit!"
+renderResult NoopResult _ = do
+  pure unit
+renderResult ExitResult _ = do
+  log "Goodbye"
+  exit 0 # void
 
 main :: Effect Unit
 main = do
-  let env = { exit: (exit 0) }
+  let env = { }
   log "Generating world..."
   state <- initializeState env
   log ""
